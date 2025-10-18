@@ -1,0 +1,1 @@
+This folder contains helper scripts such as update-websites.js

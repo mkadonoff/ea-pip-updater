@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.vscode/
+coverage/
+
+# Local env file with secrets - keep out of git
+.env
