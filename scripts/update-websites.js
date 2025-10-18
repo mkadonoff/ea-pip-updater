@@ -40,8 +40,15 @@ const CONFIG = {
   username: process.env.EA_USERNAME || '',
   password: process.env.EA_PASSWORD || '',
   companyID: process.env.EA_COMPANYID || '',
-  version: '25.0'
+  version: '25.0',
+  // Feature flags moved into code (defaults). Use CLI flags to override.
+  forceWww: true,
+  debug: false
 };
+
+// Google CSE keys (optional)
+const GOOGLE_CSE_KEY = process.env.GOOGLE_CSE_KEY || '';
+const GOOGLE_CX = process.env.GOOGLE_CX || '';
 
 // Create readline interface for interactive input
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -50,7 +57,7 @@ const question = (q) => new Promise((res) => rl.question(q, res));
 // Make SOAP request
 async function soapRequest(method, body) {
   const soapEnvelope = `<?xml version="1.0" encoding="utf-8"?>\n<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" \n               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" \n               xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n  <soap:Body>\n    <${method} xmlns="${CONFIG.namespace}">\n      <Auth>\n        <User>${CONFIG.username}</User>\n        <Password>${CONFIG.password}</Password>\n        <CompanyID>${CONFIG.companyID}</CompanyID>\n        <Version>${CONFIG.version}</Version>\n      </Auth>\n      ${body}\n    </${method}>\n  </soap:Body>\n</soap:Envelope>`;
-  const debug = !!process.env.EA_DEBUG;
+  const debug = !!CONFIG.debug;
   if (debug) {
     console.log('\n--- SOAP Request ---');
     console.log(soapEnvelope);
@@ -134,8 +141,30 @@ async function getCustomer(customerCode) {
 
 // Search web for company website (placeholder)
 async function searchForWebsite(customerName, city, state) {
-  // This is intentionally a stub. For automation, integrate Google/Bing or another datasource.
-  return null;
+  if (!GOOGLE_CSE_KEY || !GOOGLE_CX) return null;
+  const query = `${customerName} ${city} ${state} official website`;
+  // simple GET to Google's Custom Search JSON API
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({ key: GOOGLE_CSE_KEY, cx: GOOGLE_CX, q: query });
+    const options = {
+      method: 'GET',
+      headers: { 'User-Agent': 'ea-pip-updater/1.0' }
+    };
+    const req = https.request(`https://www.googleapis.com/customsearch/v1?${params.toString()}`, options, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (!json.items || json.items.length === 0) return resolve(null);
+          const link = json.items[0].link;
+          try { const u = new URL(link); return resolve(normalizeDomain(u.hostname)); } catch (e) { return resolve(normalizeDomain(link)); }
+        } catch (e) { return resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
 }
 
 // Normalize domain
@@ -147,12 +176,12 @@ function normalizeDomain(url) {
   try {
     const u = new URL(url.startsWith('http') ? url : `https://${url}`);
     let host = u.hostname;
-    if (!host.startsWith('www.')) host = `www.${host}`;
+    if (CONFIG.forceWww && !host.startsWith('www.')) host = `www.${host}`;
     return host;
   } catch (e) {
     // Fallback: strip protocol and path, then ensure www prefix
     url = url.replace(/^(https?:\/\/)?(www\.)?/i, '').split('/')[0];
-    if (!/^www\./i.test(url)) url = `www.${url}`;
+    if (CONFIG.forceWww && !/^www\./i.test(url)) url = `www.${url}`;
     return url;
   }
 }
@@ -174,33 +203,51 @@ async function processCustomer(customerCode, opts = {}) {
   try {
     const customer = await getCustomer(customerCode);
 
-    console.log('\n--- Customer Information ---');
-    console.log(`ID: ${customer.id}`);
-    console.log(`Code: ${customer.code}`);
-    console.log(`Name: ${customer.name}`);
-    console.log(`Location: ${customer.city}, ${customer.state}`);
-    console.log(`Phone: ${customer.phone}`);
-  console.log(`Current Website: ${customer.currentWebsite || '(empty)'}`);
-    console.log('---------------------------\n');
+    // Concise customer header for interactive flows
+    console.log(`\nProcessing ${customer.code || customerCode}: ${customer.name || '(no name)'} — ${customer.city || ''}${customer.state ? ', ' + customer.state : ''} — ${customer.phone || ''}`);
+    console.log(`Current Website: ${customer.currentWebsite || '(empty)'}\n`);
 
     // If website exists and not forcing override, ask or skip
     if (customer.currentWebsite && customer.currentWebsite.trim() !== '' && !opts.force) {
       if (opts.nonInteractive) {
         return { success: true, skipped: true };
       }
-      const overwrite = await question(`Website already exists. Overwrite? (y/n): `);
-      if (overwrite.toLowerCase() !== 'y') return { success: true, skipped: true };
+      // Offer a compact choice: overwrite, enter new, or skip
+      const resp = (await question(`Current website exists: ${customer.currentWebsite}\nChoose: (o)verwrite, (e)nter new, (s)kip: `)).trim().toLowerCase();
+      if (resp === 's') return { success: true, skipped: true };
+      if (resp === 'e') {
+        const manual = await question('Enter website URL (or press Enter to skip): ');
+        if (!manual || manual.trim() === '') return { success: true, skipped: true };
+        websiteUrl = manual;
+      }
+      // if resp is 'o' or anything else, continue and let candidate search or prompt decide
     }
 
     // If a website was provided in opts, use it (non-interactive mode)
     let websiteUrl = opts.website;
     if (!websiteUrl) {
-      // Attempt automated search (stub)
-      await searchForWebsite(customer.name, customer.city, customer.state);
-      if (opts.nonInteractive) {
-        return { success: true, skipped: true };
+      // Attempt automated search and present a compact choice
+      const candidate = await searchForWebsite(customer.name, customer.city, customer.state);
+      if (candidate) {
+        if (opts.nonInteractive) {
+          if (opts.force) websiteUrl = candidate;
+        } else {
+          const choice = (await question(`Candidate website found: ${candidate}\nChoose: (u)se / (e)nter / (s)kip: `)).trim().toLowerCase();
+          if (choice === 'u') websiteUrl = candidate;
+          else if (choice === 'e') {
+            const manual = await question('Enter website URL (or press Enter to skip): ');
+            if (manual && manual.trim() !== '') websiteUrl = manual;
+            else return { success: true, skipped: true };
+          } else {
+            return { success: true, skipped: true };
+          }
+        }
+      } else {
+        if (opts.nonInteractive) return { success: true, skipped: true };
+        const manual = await question('Enter website URL (or press Enter to skip): ');
+        if (!manual || manual.trim() === '') return { success: true, skipped: true };
+        websiteUrl = manual;
       }
-      websiteUrl = await question('Enter website URL (or press Enter to skip): ');
     }
 
     if (!websiteUrl || websiteUrl.trim() === '') return { success: true, skipped: true };
@@ -209,8 +256,8 @@ async function processCustomer(customerCode, opts = {}) {
     console.log(`Normalized URL: ${normalizedUrl}`);
 
     if (!opts.nonInteractive) {
-      const confirm = await question(`Save this website? (y/n): `);
-      if (confirm.toLowerCase() !== 'y') return { success: true, skipped: true };
+      const confirm = (await question(`Save this website for ${customer.code || customerCode}? (y/n): `)).trim().toLowerCase();
+      if (confirm !== 'y') return { success: true, skipped: true };
     }
 
   // Ensure we don't send empty <Value> elements which some SOAP parsers reject
@@ -241,10 +288,7 @@ async function processCustomerList(customerCodes, opts = {}) {
     const res = await processCustomer(code, { nonInteractive: opts.nonInteractive, website, force: opts.force });
     if (res.skipped) results.skipped++; else if (res.success) results.updated++; else results.failed++;
 
-    if (!opts.nonInteractive && i < customerCodes.length - 1) {
-      const cont = await question('\nContinue to next customer? (y/n): ');
-      if (cont.toLowerCase() !== 'y') break;
-    }
+    // No per-customer continue prompt; loop continues until all rows processed or user Ctrl+C
   }
 
   console.log('\n========================================');
@@ -280,8 +324,15 @@ async function main() {
   if (args.companyID) CONFIG.companyID = args.companyID;
   if (args.endpoint) CONFIG.endpoint = args.endpoint;
   if (args.namespace) CONFIG.namespace = args.namespace;
+  // CLI flags to control behavior previously read from environment
+  if (Object.prototype.hasOwnProperty.call(args, 'force-www')) CONFIG.forceWww = true;
+  if (Object.prototype.hasOwnProperty.call(args, 'no-force-www')) CONFIG.forceWww = false;
+  if (Object.prototype.hasOwnProperty.call(args, 'debug')) CONFIG.debug = true;
+  if (Object.prototype.hasOwnProperty.call(args, 'no-debug')) CONFIG.debug = false;
 
-  const nonInteractive = !!(args.file || args.codes || args.yes || args['non-interactive']);
+  // Determine non-interactive modes. Note: --file can be run interactively with --prompt
+  const fileInteractive = !!(args.prompt || args.interactive);
+  const nonInteractive = !!(args.codes || args.yes || args['non-interactive']);
   const autoYes = !!args.yes;
 
   try {
@@ -290,7 +341,9 @@ async function main() {
       if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
       const rows = readCsvFile(filePath);
       console.log(`Loaded ${rows.length} rows from ${filePath}`);
-      await processCustomerList(rows, { nonInteractive: true, force: !!args.force });
+      // if --prompt/--interactive passed, run prompts per customer
+      const runNonInteractive = !fileInteractive;
+      await processCustomerList(rows, { nonInteractive: runNonInteractive, force: !!args.force });
       rl.close();
       return;
     }
@@ -302,8 +355,8 @@ async function main() {
       return;
     }
 
-    // If missing credentials and running non-interactively, error
-    if (nonInteractive && (!CONFIG.username || !CONFIG.password || !CONFIG.companyID)) {
+    // If missing credentials and running strictly non-interactively (no prompts), error
+    if ((nonInteractive || (args.file && !fileInteractive)) && (!CONFIG.username || !CONFIG.password || !CONFIG.companyID)) {
       throw new Error('Missing credentials/companyID for non-interactive run. Provide --username --password --companyID');
     }
 
