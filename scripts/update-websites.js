@@ -50,6 +50,12 @@ const question = (q) => new Promise((res) => rl.question(q, res));
 // Make SOAP request
 async function soapRequest(method, body) {
   const soapEnvelope = `<?xml version="1.0" encoding="utf-8"?>\n<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" \n               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" \n               xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n  <soap:Body>\n    <${method} xmlns="${CONFIG.namespace}">\n      <Auth>\n        <User>${CONFIG.username}</User>\n        <Password>${CONFIG.password}</Password>\n        <CompanyID>${CONFIG.companyID}</CompanyID>\n        <Version>${CONFIG.version}</Version>\n      </Auth>\n      ${body}\n    </${method}>\n  </soap:Body>\n</soap:Envelope>`;
+  const debug = !!process.env.EA_DEBUG;
+  if (debug) {
+    console.log('\n--- SOAP Request ---');
+    console.log(soapEnvelope);
+    console.log('--- End SOAP Request ---\n');
+  }
 
   return new Promise((resolve, reject) => {
     const options = {
@@ -66,8 +72,19 @@ async function soapRequest(method, body) {
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
+          if (debug) {
+            console.log('\n--- SOAP Response ---');
+            console.log(data);
+            console.log('--- End SOAP Response ---\n');
+          }
           resolve(data);
         } else {
+          if (debug) {
+            console.error('\n--- SOAP Error Response ---');
+            console.error(`HTTP ${res.statusCode}:`);
+            console.error(data);
+            console.error('--- End SOAP Error Response ---\n');
+          }
           reject(new Error(`HTTP ${res.statusCode}: ${data}`));
         }
       });
@@ -122,23 +139,22 @@ async function searchForWebsite(customerName, city, state) {
 }
 
 // Normalize domain
+// Default behavior: return hostname only (no protocol) and ensure it starts with www.
 function normalizeDomain(url) {
   if (!url) return '';
   url = url.trim();
-  // If user entered a full URL, keep it but normalize
-  if (/^https?:\/\//i.test(url)) {
-    // remove trailing path but keep protocol
-    try {
-      const u = new URL(url);
-      return `${u.protocol}//${u.hostname}`;
-    } catch (e) {
-      // fallthrough
-    }
+  // If user entered a full URL, parse and take hostname
+  try {
+    const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+    let host = u.hostname;
+    if (!host.startsWith('www.')) host = `www.${host}`;
+    return host;
+  } catch (e) {
+    // Fallback: strip protocol and path, then ensure www prefix
+    url = url.replace(/^(https?:\/\/)?(www\.)?/i, '').split('/')[0];
+    if (!/^www\./i.test(url)) url = `www.${url}`;
+    return url;
   }
-
-  // Remove protocol and path
-  url = url.replace(/^(https?:\/\/)?(www\.)?/i, '').split('/')[0];
-  return `https://${url}`;
 }
 
 // Save customer website
@@ -164,7 +180,7 @@ async function processCustomer(customerCode, opts = {}) {
     console.log(`Name: ${customer.name}`);
     console.log(`Location: ${customer.city}, ${customer.state}`);
     console.log(`Phone: ${customer.phone}`);
-    console.log(`Current Website: ${customer.currentWebsite || '(empty)'}');
+  console.log(`Current Website: ${customer.currentWebsite || '(empty)'}`);
     console.log('---------------------------\n');
 
     // If website exists and not forcing override, ask or skip
@@ -197,7 +213,10 @@ async function processCustomer(customerCode, opts = {}) {
       if (confirm.toLowerCase() !== 'y') return { success: true, skipped: true };
     }
 
-    const saved = await saveCustomerWebsite(customer.id, customer.code, normalizedUrl);
+  // Ensure we don't send empty <Value> elements which some SOAP parsers reject
+  const outId = (customer.id && customer.id.trim() !== '') ? customer.id : '0';
+  const outCode = (customer.code && customer.code.trim() !== '') ? customer.code : customerCode;
+  const saved = await saveCustomerWebsite(outId, outCode, normalizedUrl);
     if (saved) console.log('✓ Website updated successfully!');
     else console.log('✗ Failed to update website');
     return { success: saved, skipped: false };

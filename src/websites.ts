@@ -107,14 +107,16 @@ async function saveCustomerWebsite(customerId: string, customerCode: string, web
 function normalizeDomain(url?: string): string {
   if (!url) return '';
   url = url.trim();
-  if (/^https?:\/\//i.test(url)) {
-    try {
-      const u = new URL(url);
-      return `${u.protocol}//${u.hostname}`;
-    } catch (e) { }
+  try {
+    const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+    let host = u.hostname;
+    if (!host.startsWith('www.')) host = `www.${host}`;
+    return host;
+  } catch (e) {
+    url = url.replace(/^(https?:\/\/)?(www\.)?/i, '').split('/')[0];
+    if (!/^www\./i.test(url)) url = `www.${url}`;
+    return url;
   }
-  url = url.replace(/^(https?:\/\/)?(www\.)?/i, '').split('/')[0];
-  return `https://${url}`;
 }
 
 function readCsvFile(filePath: string): Array<string | { code: string; website: string }> {
@@ -167,7 +169,10 @@ async function processCustomer(customerCode: string, opts: { nonInteractive?: bo
       if (confirm.toLowerCase() !== 'y') return { success: true, skipped: true };
     }
 
-    const saved = await saveCustomerWebsite(customer.id, customer.code, normalizedUrl, config);
+  // Avoid sending empty <Value> elements - use '0' for missing IDs and fallback to customerCode for missing Code
+  const outId = (customer.id && customer.id.trim() !== '') ? customer.id : '0';
+  const outCode = (customer.code && customer.code.trim() !== '') ? customer.code : customerCode;
+  const saved = await saveCustomerWebsite(outId, outCode, normalizedUrl, config);
     if (saved) console.log('✓ Website updated successfully!');
     else console.log('✗ Failed to update website');
     return { success: saved, skipped: false };
