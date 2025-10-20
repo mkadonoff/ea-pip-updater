@@ -1,7 +1,28 @@
 #!/usr/bin/env node
 // Enhanced Customer Website Bulk Updater for e-automate PIP Interface
 // Features: Smart domain guessing, improved Google CSE, OpenAI fallback
-// Run: node scripts/update-websites.js
+//
+// Usage:
+//   Interactive mode:     node scripts/update-websites.js
+//   Process from CSV:     node scripts/update-websites.js --file customers.csv
+//   Scan for missing:     node scripts/update-websites.js --scan --output missing.csv
+//   Scan last hour:       node scripts/update-websites.js --scan --hours 1 --output missing.csv
+//   Scan and update:      node scripts/update-websites.js --scan --update --yes
+//   Specific customers:   node scripts/update-websites.js --codes A01,A02,A03
+//
+// Flags:
+//   --scan / --find-missing   Scan all customers and find those with missing websites
+//   --hours <number>          Hours to look back for customer changes (default: 24)
+//   --update                  Update customers found by --scan
+//   --file <path>             Process customers from CSV file
+//   --codes <list>            Process specific customer codes (comma-separated)
+//   --interactive             Enable prompts even with --file
+//   --yes                     Auto-confirm all saves (non-interactive)
+//   --force                   Overwrite existing websites
+//   --output <path>           Write results/list to CSV file
+//   --update-results <path>   Write update results to CSV (with --scan --update)
+//   --enable-openai           Enable OpenAI search fallback
+//   --debug                   Show SOAP request/response details
 
 const https = require('https');
 const http = require('http');
@@ -37,7 +58,7 @@ try {
 }
 
 const CONFIG = {
-  endpoint: 'https://sfs.rpg.com/pip/PublicAPIService.asmx',
+  endpoint: process.env.PIP_ENDPOINT || 'https://sfs.rpg.com/pip/PublicAPIService.asmx',
   namespace: 'http://digitalgateway.com/WebServices/PublicAPIService',
   username: process.env.EA_USERNAME || '',
   password: process.env.EA_PASSWORD || '',
@@ -103,7 +124,9 @@ async function soapRequest(method, body) {
       }
     };
 
-    const req = https.request(CONFIG.endpoint, options, (res) => {
+    // Use http or https based on endpoint protocol
+    const protocol = CONFIG.endpoint.startsWith('https') ? https : http;
+    const req = protocol.request(CONFIG.endpoint, options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
@@ -165,6 +188,37 @@ async function getCustomer(customerCode) {
     phone: parseXmlValue(response, 'Phone1'),
     currentWebsite: parseXmlValue(response, 'WebSite')
   };
+}
+
+async function getCustomerList(hoursBack = 24) {
+  // Use timestamp from specified hours ago to get recent customers
+  const pastDate = new Date();
+  pastDate.setHours(pastDate.getHours() - hoursBack);
+  const timestamp = pastDate.toISOString();
+  
+  const body = `<TimeStamp>${timestamp}</TimeStamp>`;
+
+  console.log(`Fetching customers updated since: ${timestamp} (${hoursBack} hours ago)`);
+  const response = await soapRequest('getCustomerList', body);
+  
+  // Parse the customer list from XML
+  // getCustomerList returns CustomerListDetail with CustomerNumber (ID/Code), CustomerName, and Active
+  const customers = [];
+  const customerMatches = response.matchAll(/<CustomerListDetail>[\s\S]*?<CustomerNumber>[\s\S]*?<ID>[\s\S]*?<Value>(.*?)<\/Value>[\s\S]*?<\/ID>[\s\S]*?<Code>[\s\S]*?<Value>(.*?)<\/Value>[\s\S]*?<\/Code>[\s\S]*?<\/CustomerNumber>[\s\S]*?<CustomerName>[\s\S]*?<Value>(.*?)<\/Value>[\s\S]*?<\/CustomerName>[\s\S]*?<Active>[\s\S]*?<Value>(.*?)<\/Value>[\s\S]*?<\/Active>[\s\S]*?<\/CustomerListDetail>/g);
+  
+  for (const match of customerMatches) {
+    const id = match[1].trim();
+    const code = match[2].trim();
+    const name = match[3].trim();
+    const active = match[4].trim();
+    
+    if (active.toLowerCase() === 'true' && code) {
+      customers.push({ id, code, name });
+    }
+  }
+  
+  console.log(`Found ${customers.length} active customers from list`);
+  return customers;
 }
 
 async function saveCustomerWebsite(customerId, customerCode, websiteUrl) {
@@ -749,6 +803,74 @@ async function main() {
   const autoConfirm = !!args.yes;
 
   try {
+    // Scan mode - Find all customers with missing websites
+    if (args.scan || args['find-missing']) {
+      const hoursBack = args.hours ? parseInt(args.hours) : 24;
+      console.log('Fetching customer list from PIP...\n');
+      const customerList = await getCustomerList(hoursBack);
+      console.log(`Found ${customerList.length} active customers from change list`);
+      
+      // Now fetch full details for each customer to check website field
+      console.log('Fetching full customer details to check websites...\n');
+      const allCustomers = [];
+      for (let i = 0; i < customerList.length; i++) {
+        const item = customerList[i];
+        try {
+          const customer = await getCustomer(item.code);
+          allCustomers.push(customer);
+          if ((i + 1) % 10 === 0) {
+            console.log(`  Progress: ${i + 1}/${customerList.length} customers checked`);
+          }
+        } catch (error) {
+          console.error(`  Error fetching ${item.code}: ${error.message}`);
+        }
+      }
+      
+      console.log(`\nTotal customers checked: ${allCustomers.length}`);
+      
+      // Filter for missing websites
+      const missingWebsites = allCustomers.filter(c => !c.currentWebsite || c.currentWebsite.trim() === '');
+      console.log(`Customers with missing websites: ${missingWebsites.length}\n`);
+      
+      if (missingWebsites.length === 0) {
+        console.log('All customers have websites!');
+        rl.close();
+        return;
+      }
+      
+      // Save to CSV if requested
+      if (args.output) {
+        const outputPath = path.resolve(process.cwd(), args.output);
+        const lines = ['code,name,city,state'];
+        for (const c of missingWebsites) {
+          lines.push(`${c.code},${c.name},${c.city || ''},${c.state || ''}`);
+        }
+        fs.writeFileSync(outputPath, lines.join('\n'), 'utf8');
+        console.log(`Missing website list written to: ${outputPath}\n`);
+      }
+      
+      // Process them if --update flag is present
+      if (args.update) {
+        console.log('Processing customers with missing websites...\n');
+        const codes = missingWebsites.map(c => c.code);
+        const { results, detailed } = await processCustomerList(codes, { 
+          nonInteractive: !args.interactive, 
+          force: !!args.force,
+          autoConfirm 
+        });
+        
+        // Write results to CSV
+        if (args['update-results']) {
+          const resultsPath = path.resolve(process.cwd(), args['update-results']);
+          writeResultsCsv(resultsPath, detailed);
+          console.log(`\nUpdate results written to: ${resultsPath}`);
+        }
+      }
+      
+      rl.close();
+      return;
+    }
+    
     // File mode
     if (args.file) {
       const filePath = path.resolve(process.cwd(), args.file);
