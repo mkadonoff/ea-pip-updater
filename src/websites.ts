@@ -3,6 +3,7 @@ import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
 import { loadEnv } from "./config";
+import { googleSearch } from "./google-search";
 
 export interface WebsitesOptions {
   file?: string;

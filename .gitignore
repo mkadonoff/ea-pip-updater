@@ -5,3 +5,8 @@ coverage/
 
 # Local env file with secrets - keep out of git
 .env
+
+# Results and customer data files
+results*.csv
+customers.*.csv
+tmp-*.csv
